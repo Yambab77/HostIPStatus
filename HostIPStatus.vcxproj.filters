@@ -27,9 +27,30 @@
     <ClInclude Include="HostIPStatus.h">
       <Filter>头文件</Filter>
     </ClInclude>
+    <ClInclude Include="function\UI.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
+    <ClInclude Include="function\AppMessages.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
+    <ClInclude Include="function\Scan.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
+    <ClInclude Include="function\ClipboardUtil.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="HostIPStatus.cpp">
+      <Filter>源文件</Filter>
+    </ClCompile>
+    <ClCompile Include="function\UI.cpp">
+      <Filter>源文件</Filter>
+    </ClCompile>
+    <ClCompile Include="function\Scan.cpp">
+      <Filter>源文件</Filter>
+    </ClCompile>
+    <ClCompile Include="function\ClipboardUtil.cpp">
       <Filter>源文件</Filter>
     </ClCompile>
   </ItemGroup>

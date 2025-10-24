@@ -6,6 +6,17 @@
 #endif
 
 #include <windows.h>
+<<<<<<< HEAD
+#include <commctrl.h>
+#pragma comment(lib, "Comctl32.lib")
+
+#include "resource.h"
+#include "function/UI.h"
+
+int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
+    INITCOMMONCONTROLSEX icc{ sizeof(icc), ICC_WIN95_CLASSES };
+    InitCommonControlsEx(&icc);
+=======
 #include <windowsx.h>
 #include <commctrl.h> // 新增：Header 控件
 #pragma comment(lib, "Comctl32.lib")
@@ -640,6 +651,7 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
     INITCOMMONCONTROLSEX icc{ sizeof(icc), ICC_WIN95_CLASSES };
     InitCommonControlsEx(&icc);
 
+>>>>>>> 74ef50d17349b800791007dc82c3872e5e27e3e6
     return (int)DialogBoxParamW(hInstance, MAKEINTRESOURCEW(IDD_MAIN), nullptr, DlgProc, 0);
 }
 

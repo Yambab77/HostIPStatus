@@ -124,11 +124,18 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClInclude Include="framework.h" />
+    <ClInclude Include="function\AppMessages.h" />
+    <ClInclude Include="function\ClipboardUtil.h" />
+    <ClInclude Include="function\Scan.h" />
+    <ClInclude Include="function\UI.h" />
     <ClInclude Include="HostIPStatus.h" />
     <ClInclude Include="Resource.h" />
     <ClInclude Include="targetver.h" />
   </ItemGroup>
   <ItemGroup>
+    <ClCompile Include="function\ClipboardUtil.cpp" />
+    <ClCompile Include="function\Scan.cpp" />
+    <ClCompile Include="function\UI.cpp" />
     <ClCompile Include="HostIPStatus.cpp" />
   </ItemGroup>
   <ItemGroup>
