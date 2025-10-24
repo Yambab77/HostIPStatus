@@ -51,4 +51,7 @@
 #endif
 #endif
 
+// 仅展示新增ID，若你已有文件，请添加以下定义
+#define IDC_HEADER_RESULTS            1200
+
 #endif // RESOURCE_H_INCLUDED
