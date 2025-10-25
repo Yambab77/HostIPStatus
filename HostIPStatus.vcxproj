@@ -140,6 +140,7 @@
   </ItemGroup>
   <ItemGroup>
     <ResourceCompile Include="HostIPStatus.rc" />
+    <ResourceCompile Include="rc HostIPStatus.rc" />
   </ItemGroup>
   <ItemGroup>
     <Image Include="HostIPStatus.ico" />

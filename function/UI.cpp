@@ -5,6 +5,12 @@
 #define NOMINMAX
 #endif
 
+// 确保启用 GetAdaptersAddresses 等声明（Vista+）
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0600
+#endif
+#include <sdkddkver.h>
+
 #include <windows.h>
 #include <windowsx.h>
 #include <commctrl.h>
@@ -14,6 +20,8 @@
 #include <sstream>
 #include <atomic>
 #include <algorithm>
+#include <iphlpapi.h>
+#pragma comment(lib, "Iphlpapi.lib")
 
 #include "../Resource.h"
 #include "AppMessages.h"
@@ -26,6 +34,42 @@ static std::atomic_bool g_scanning{ false };
 // ListBox 子类过程（用于 Ctrl+C）
 static WNDPROC g_ListOldProc = nullptr;
 
+// 放在文件前部其它静态函数附近
+static WNDPROC g_IpEditOldProc = nullptr;
+
+// 子类过程：在 IP 段输入框里按下 '.' 时跳到下一个输入框
+static LRESULT CALLBACK IpEdit_SubclassProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch (msg) {
+    case WM_KEYDOWN:
+        if (wParam == VK_DECIMAL || wParam == VK_OEM_PERIOD) { // 小键盘 '.' 和主键盘 '.'
+            LONG_PTR nextId = GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+            if (nextId) {
+                HWND hDlg = GetParent(hwnd);
+                if (HWND hNext = GetDlgItem(hDlg, (int)nextId)) {
+                    SetFocus(hNext);
+                    SendMessageW(hNext, EM_SETSEL, 0, -1);
+                }
+            }
+            return 0; // 吞掉按键
+        }
+        break;
+    case WM_CHAR:
+        if (wParam == L'.' || wParam == L'。' || wParam == L'，') { // 处理常见全角标点
+            LONG_PTR nextId = GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+            if (nextId) {
+                HWND hDlg = GetParent(hwnd);
+                if (HWND hNext = GetDlgItem(hDlg, (int)nextId)) {
+                    SetFocus(hNext);
+                    SendMessageW(hNext, EM_SETSEL, 0, -1);
+                }
+            }
+            return 0; // 吞掉字符
+        }
+        break;
+    }
+    return CallWindowProcW(g_IpEditOldProc, hwnd, msg, wParam, lParam);
+}
+
 // 帮助函数 —— 初始化数字输入框(限制3位/仅数字)
 static void InitIpPartEdit(HWND hEdit) {
     SendMessageW(hEdit, EM_SETLIMITTEXT, 3, 0);
@@ -34,7 +78,7 @@ static void InitIpPartEdit(HWND hEdit) {
     SetWindowLongPtrW(hEdit, GWL_STYLE, style);
 }
 
-// 获取编辑框中的数值（0-255），ok=false 表示为空或非数值
+// 获取编辑框中的数值（0-255），ok=false 表示不能为空或非数值
 static int GetEditU8(HWND hDlg, int id, bool& ok) {
     wchar_t buf[8]{};
     GetDlgItemTextW(hDlg, id, buf, 7);
@@ -109,9 +153,9 @@ static bool CopySelectedResults(HWND hDlg) {
         int idx = selIdx[i];
         int len = (int)SendMessageW(hList, LB_GETTEXTLEN, idx, 0);
         if (len <= 0) continue;
-        std::wstring line(len, L'\0');
-        SendMessageW(hList, LB_GETTEXT, idx, (LPARAM)line.data());
-        out.append(line);
+        std::vector<wchar_t> buf((size_t)len + 1);
+        SendMessageW(hList, LB_GETTEXT, idx, (LPARAM)buf.data());
+        out.append(buf.data()); // 利用以'\0'结尾的缓冲区
         if (i + 1 < selIdx.size()) out.append(L"\r\n");
     }
 
@@ -154,22 +198,34 @@ static void SetScanningUI(HWND hDlg, bool scanning) {
     }
 }
 
-// 根据像素列起点设置 ListBox 的制表位（LB_SETTABSTOPS 以对话框基准平均字符宽为单位）
-static void SetListTabStopsByPixels(HWND hList, const std::vector<int>& colLeftPx) {
+// 根据像素列起点设置 ListBox 的制表位（准确换算到 DLU，基于列表当前字体）
+// adjustPx 可为负，用于整体细调相对 Header 的对齐（左移为负，右移为正）
+static void SetListTabStopsByPixels(HWND hList, const std::vector<int>& colLeftPx, int adjustPx) {
     if (!hList || colLeftPx.empty()) return;
 
-    int baseX = LOWORD(GetDialogBaseUnits());
-    if (baseX <= 0) baseX = 8;
+    HFONT hFont = (HFONT)SendMessageW(hList, WM_GETFONT, 0, 0);
+    HDC hdc = GetDC(hList);
+    HFONT hOld = nullptr;
+    if (hFont) hOld = (HFONT)SelectObject(hdc, hFont);
 
-    const int leftPaddingPx = 6;
+    TEXTMETRICW tm{};
+    if (!GetTextMetricsW(hdc, &tm) || tm.tmAveCharWidth <= 0) {
+        int baseX = LOWORD(GetDialogBaseUnits());
+        tm.tmAveCharWidth = (baseX > 0) ? baseX : 8;
+    }
+    if (hOld) SelectObject(hdc, hOld);
+    ReleaseDC(hList, hdc);
 
     std::vector<int> stops;
     stops.reserve(colLeftPx.size());
     for (int px : colLeftPx) {
-        int chars = (leftPaddingPx + px + baseX / 2) / baseX;
-        if (chars < 0) chars = 0;
-        stops.push_back(chars);
+        int pxAdj = px + adjustPx;       // 细调：整体左移/右移
+        if (pxAdj < 0) pxAdj = 0;
+        int dlu = MulDiv(pxAdj, 4, tm.tmAveCharWidth); // 像素 -> 水平 DLU
+        if (dlu < 0) dlu = 0;
+        stops.push_back(dlu);
     }
+
     SendMessageW(hList, LB_SETTABSTOPS, (WPARAM)stops.size(), (LPARAM)stops.data());
 }
 
@@ -183,6 +239,59 @@ static int MeasureTextWidthPx(HWND hwndRef, HFONT hFont, const wchar_t* text) {
     if (hOld) SelectObject(hdc, hOld);
     ReleaseDC(hwndRef, hdc);
     return sz.cx;
+}
+
+// 获取本机 IPv4 的前三段（优先私有网段），失败返回 false
+static bool GetLocalIPv4First3(int& o1, int& o2, int& o3) {
+    // 解析 "a.b.c.d"
+    auto parseIPv4A = [](const char* s, BYTE& a, BYTE& b, BYTE& c, BYTE& d) -> bool {
+        if (!s || !*s) return false;
+        unsigned long v[4] = { 0,0,0,0 };
+        char ch = 0;
+        if (sscanf_s(s, "%lu.%lu.%lu.%lu%c", &v[0], &v[1], &v[2], &v[3], &ch, 1) < 4) return false;
+        for (int i = 0; i < 4; ++i) if (v[i] > 255) return false;
+        a = (BYTE)v[0]; b = (BYTE)v[1]; c = (BYTE)v[2]; d = (BYTE)v[3];
+        return true;
+    };
+    auto isPrivate = [](BYTE a, BYTE b) {
+        if (a == 10) return true;
+        if (a == 172 && b >= 16 && b <= 31) return true;
+        if (a == 192 && b == 168) return true;
+        return false;
+    };
+
+    ULONG size = 0;
+    // 预查询长度
+    DWORD dw = GetAdaptersInfo(nullptr, &size);
+    if (dw != ERROR_BUFFER_OVERFLOW || size == 0) return false;
+
+    std::vector<BYTE> buf(size);
+    IP_ADAPTER_INFO* pInfo = reinterpret_cast<IP_ADAPTER_INFO*>(buf.data());
+    if (GetAdaptersInfo(pInfo, &size) != NO_ERROR) return false;
+
+    int best[3] = { -1,-1,-1 };
+
+    for (IP_ADAPTER_INFO* p = pInfo; p; p = p->Next) {
+        if (p->Type == MIB_IF_TYPE_LOOPBACK) continue;
+
+        // 遍历该网卡的所有 IPv4 地址
+        for (IP_ADDR_STRING* ip = &p->IpAddressList; ip; ip = ip->Next) {
+            const char* s = ip->IpAddress.String;
+            if (!s || !*s || strcmp(s, "0.0.0.0") == 0) continue;
+
+            BYTE a, b, c, d;
+            if (!parseIPv4A(s, a, b, c, d)) continue;
+            if (a == 127 || (a == 169 && b == 254)) continue; // 跳过回环与 APIPA
+
+            if (isPrivate(a, b)) {
+                o1 = a; o2 = b; o3 = c; return true; // 私有地址直接返回
+            }
+            if (best[0] < 0) { best[0] = a; best[1] = b; best[2] = c; }
+        }
+    }
+
+    if (best[0] >= 0) { o1 = best[0]; o2 = best[1]; o3 = best[2]; return true; }
+    return false;
 }
 
 INT_PTR CALLBACK DlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -201,7 +310,7 @@ INT_PTR CALLBACK DlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM lParam) {
                 RECT rc{}; GetWindowRect(hListOld, &rc);
                 MapWindowPoints(nullptr, hDlg, reinterpret_cast<POINT*>(&rc), 2);
                 DWORD exStyle = (DWORD)GetWindowLongPtrW(hListOld, GWL_EXSTYLE);
-                HFONT hFont = (HFONT)SendMessageW(hListOld, WM_GETFONT, 0, 0);
+                HFONT hFontOld = (HFONT)SendMessageW(hListOld, WM_GETFONT, 0, 0);
 
                 // 创建 Header 控件
                 int totalW = rc.right - rc.left;
@@ -209,8 +318,8 @@ INT_PTR CALLBACK DlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM lParam) {
                     0, WC_HEADERW, L"", WS_CHILD | WS_VISIBLE | HDS_BUTTONS | HDS_HORZ,
                     rc.left, rc.top, totalW, 24, hDlg, (HMENU)(INT_PTR)IDC_HEADER_RESULTS, GetModuleHandleW(nullptr), nullptr);
 
-                if (hHeader && hFont) {
-                    SendMessageW(hHeader, WM_SETFONT, (WPARAM)hFont, TRUE);
+                if (hHeader && hFontOld) {
+                    SendMessageW(hHeader, WM_SETFONT, (WPARAM)hFontOld, TRUE);
                 }
 
                 int headerH = 0;
@@ -220,58 +329,70 @@ INT_PTR CALLBACK DlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM lParam) {
                     if (headerH < 22) headerH = 22;
                 }
 
-                // 配置表头列
-                if (hHeader) {
-                    const wchar_t* tIP = L"IP";
-                    const wchar_t* tSSH = L"SSH";
-                    const wchar_t* tRDP = L"RDP";
-                    const wchar_t* tTEL = L"TELNET";
+                // 配置表头列并计算新 ListBox 的制表位
+                std::vector<int> tabLeftPx;
+                {
+                    const wchar_t* tIP   = L"IP";
+                    const wchar_t* tHOST = L"主机名";
+                    const wchar_t* tSSH  = L"SSH";
+                    const wchar_t* tRDP  = L"RDP";
+                    const wchar_t* tTEL  = L"TELNET";
                     const wchar_t* tHTTP = L"HTTP/HTTPS";
 
                     const int pad = 20;
-                    int wSSH = MeasureTextWidthPx(hHeader, hFont, tSSH) + pad;   if (wSSH < 48)  wSSH = 48;
-                    int wRDP = MeasureTextWidthPx(hHeader, hFont, tRDP) + pad;   if (wRDP < 48)  wRDP = 48;
-                    int wTEL = MeasureTextWidthPx(hHeader, hFont, tTEL) + pad;   if (wTEL < 72)  wTEL = 72;
-                    int wHHT = MeasureTextWidthPx(hHeader, hFont, tHTTP) + pad;  if (wHHT < 110) wHHT = 110;
+                    int wHOST = MeasureTextWidthPx(hHeader, hFontOld, tHOST) + pad; if (wHOST < 160) wHOST = 160;
+                    int wSSH  = MeasureTextWidthPx(hHeader, hFontOld, tSSH)  + pad; if (wSSH  < 48)  wSSH  = 48;
+                    int wRDP  = MeasureTextWidthPx(hHeader, hFontOld, tRDP)  + pad; if (wRDP  < 48)  wRDP  = 48;
+                    int wTEL  = MeasureTextWidthPx(hHeader, hFontOld, tTEL)  + pad; if (wTEL  < 72)  wTEL  = 72;
+                    int wHHT  = MeasureTextWidthPx(hHeader, hFontOld, tHTTP) + pad; if (wHHT  < 110) wHHT  = 110;
 
                     int vscrollW = GetSystemMetrics(SM_CXVSCROLL);
                     int totalViewW = (rc.right - rc.left) - vscrollW; if (totalViewW < 100) totalViewW = (rc.right - rc.left);
 
-                    int svcSum = wSSH + wRDP + wTEL + wHHT;
+                    // 现在非 IP 列包含 Host + 4 个服务列
+                    int svcSum = wHOST + wSSH + wRDP + wTEL + wHHT;
                     int ipW = totalViewW - svcSum;
-                    const int ipMin = 140;
+                    const int ipMin   = 140;
+                    const int hostMin = 120; // 保底不要太窄
                     if (ipW < ipMin) {
                         int deficit = ipMin - ipW;
                         ipW = ipMin;
-                        int d = (deficit + 3) / 4;
-                        wSSH = (std::max)(48,  wSSH - d);
-                        wRDP = (std::max)(48,  wRDP - d);
-                        wTEL = (std::max)(72,  wTEL - d);
-                        wHHT = (std::max)(110, wHHT - d);
+                        // 将缺口均摊到 5 个非 IP 列（不低于各自最小值）
+                        int d = (deficit + 4) / 5;
+                        wHOST = (std::max)(hostMin, wHOST - d);
+                        wSSH  = (std::max)(48,     wSSH  - d);
+                        wRDP  = (std::max)(48,     wRDP  - d);
+                        wTEL  = (std::max)(72,     wTEL  - d);
+                        wHHT  = (std::max)(110,    wHHT  - d);
                     }
 
                     struct { const wchar_t* text; int width; } cols[] = {
-                        { tIP, ipW }, { tSSH, wSSH }, { tRDP, wRDP }, { tTEL, wTEL }, { tHTTP, wHHT },
+                        { tIP,   ipW },
+                        { tHOST, wHOST },
+                        { tSSH,  wSSH },
+                        { tRDP,  wRDP },
+                        { tTEL,  wTEL },
+                        { tHTTP, wHHT },
                     };
-                    for (int i = 0; i < 5; ++i) {
-                        HDITEMW hd{};
-                        hd.mask = HDI_TEXT | HDI_WIDTH | HDI_FORMAT;
-                        hd.pszText = const_cast<LPWSTR>(cols[i].text);
-                        hd.cxy = cols[i].width;
-                        hd.fmt = HDF_LEFT | HDF_STRING;
-                        Header_InsertItem(hHeader, i, &hd);
+                    if (hHeader) {
+                        for (int i = 0; i < 6; ++i) {
+                            HDITEMW hd{};
+                            hd.mask = HDI_TEXT | HDI_WIDTH | HDI_FORMAT;
+                            hd.pszText = const_cast<LPWSTR>(cols[i].text);
+                            hd.cxy = cols[i].width;
+                            hd.fmt = HDF_LEFT | HDF_STRING;
+                            Header_InsertItem(hHeader, i, &hd);
+                        }
                     }
 
-                    if (HWND hList = GetDlgItem(hDlg, IDC_LIST_RESULTS)) {
-                        std::vector<int> tabLeftPx;
-                        tabLeftPx.reserve(4);
-                        int left = ipW;
-                        tabLeftPx.push_back(left);           left += wSSH;
-                        tabLeftPx.push_back(left);           left += wRDP;
-                        tabLeftPx.push_back(left);           left += wTEL;
-                        tabLeftPx.push_back(left);
-                        SetListTabStopsByPixels(hList, tabLeftPx);
-                    }
+                    // 为新 ListBox 计算列左边界像素位置（首列 IP 在制表位前，后续每列在对应 tab stop）
+                    tabLeftPx.reserve(5);
+                    int left = ipW;
+                    tabLeftPx.push_back(left); left += wHOST; // 主机名
+                    tabLeftPx.push_back(left); left += wSSH;  // SSH
+                    tabLeftPx.push_back(left); left += wRDP;  // RDP
+                    tabLeftPx.push_back(left); left += wTEL;  // TELNET
+                    tabLeftPx.push_back(left);               // HTTP/HTTPS
                 }
 
                 // 重新创建 ListBox（下移 header 高度）
@@ -281,20 +402,18 @@ INT_PTR CALLBACK DlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM lParam) {
 
                 DWORD style = WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_BORDER | WS_VSCROLL
                     | LBS_NOTIFY | LBS_EXTENDEDSEL | LBS_USETABSTOPS;
-                HWND hList = CreateWindowExW(
+                HWND hListNew = CreateWindowExW(
                     exStyle, L"LISTBOX", L"", style,
                     rcList.left, rcList.top, rcList.right - rcList.left, rcList.bottom - rcList.top,
                     hDlg, (HMENU)(INT_PTR)IDC_LIST_RESULTS, GetModuleHandleW(nullptr), nullptr);
 
-                if (hList) {
-                    if (HFONT hFont2 = (HFONT)SendMessageW(hDlg, WM_GETFONT, 0, 0)) {
-                        SendMessageW(hList, WM_SETFONT, (WPARAM)hFont2, TRUE);
-                    }
-                    else if (HFONT hFontOld = (HFONT)SendMessageW(hDlg, WM_GETFONT, 0, 0)) {
-                        SendMessageW(hList, WM_SETFONT, (WPARAM)hFontOld, TRUE);
-                    }
+                if (hListNew) {
+                    HFONT hUseFont = hFontOld;
+                    if (!hUseFont) hUseFont = (HFONT)SendMessageW(hDlg, WM_GETFONT, 0, 0);
+                    if (hUseFont) SendMessageW(hListNew, WM_SETFONT, (WPARAM)hUseFont, TRUE);
 
-                    g_ListOldProc = (WNDPROC)SetWindowLongPtrW(hList, GWLP_WNDPROC, (LONG_PTR)ListBox_SubclassProc);
+                    SetListTabStopsByPixels(hListNew, tabLeftPx, -30); // 输出状态结果左移 30px；
+                    g_ListOldProc = (WNDPROC)SetWindowLongPtrW(hListNew, GWLP_WNDPROC, (LONG_PTR)ListBox_SubclassProc);
                 }
             }
         }
@@ -326,7 +445,7 @@ INT_PTR CALLBACK DlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM lParam) {
                 InitIpPartEdit(hE);
                 x += editW + gap;
                 return hE;
-                };
+            };
 
             HWND hIP1 = mkEdit(IDC_EDIT_IP1);
             HWND hIP2 = mkEdit(IDC_EDIT_IP2);
@@ -341,11 +460,42 @@ INT_PTR CALLBACK DlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM lParam) {
 
             HWND hEnd = mkEdit(IDC_EDIT_END);
 
-            SetWindowTextW(hIP1, L"192");
-            SetWindowTextW(hIP2, L"168");
-            SetWindowTextW(hIP3, L"1");
+            // 用本机 IPv4 的前三段作为默认值；失败则回退到 192.168.1
+            int ip1 = 192, ip2 = 168, ip3 = 1;
+            GetLocalIPv4First3(ip1, ip2, ip3);
+
+            wchar_t buf1[8], buf2[8], buf3[8];
+            swprintf_s(buf1, L"%d", ip1);
+            swprintf_s(buf2, L"%d", ip2);
+            swprintf_s(buf3, L"%d", ip3);
+
+            SetWindowTextW(hIP1, buf1);
+            SetWindowTextW(hIP2, buf2);
+            SetWindowTextW(hIP3, buf3);
             SetWindowTextW(hStart, L"1");
             SetWindowTextW(hEnd, L"254");
+
+            // 为每个输入框设置“下一个控件”的 ID
+            SetWindowLongPtrW(hIP1,  GWLP_USERDATA, (LONG_PTR)IDC_EDIT_IP2);
+            SetWindowLongPtrW(hIP2,  GWLP_USERDATA, (LONG_PTR)IDC_EDIT_IP3);
+            SetWindowLongPtrW(hIP3,  GWLP_USERDATA, (LONG_PTR)IDC_EDIT_START);
+            SetWindowLongPtrW(hStart,GWLP_USERDATA, (LONG_PTR)IDC_EDIT_END);
+            SetWindowLongPtrW(hEnd,  GWLP_USERDATA, (LONG_PTR)0); // 最后一个没有下一个
+
+            // 挂接子类过程（第一次保存原始过程，后续直接设置）
+            if (!g_IpEditOldProc) {
+                g_IpEditOldProc = (WNDPROC)SetWindowLongPtrW(hIP1,   GWLP_WNDPROC, (LONG_PTR)IpEdit_SubclassProc);
+                SetWindowLongPtrW(hIP2,   GWLP_WNDPROC, (LONG_PTR)IpEdit_SubclassProc);
+                SetWindowLongPtrW(hIP3,   GWLP_WNDPROC, (LONG_PTR)IpEdit_SubclassProc);
+                SetWindowLongPtrW(hStart, GWLP_WNDPROC, (LONG_PTR)IpEdit_SubclassProc);
+                SetWindowLongPtrW(hEnd,   GWLP_WNDPROC, (LONG_PTR)IpEdit_SubclassProc);
+            } else {
+                SetWindowLongPtrW(hIP1,   GWLP_WNDPROC, (LONG_PTR)IpEdit_SubclassProc);
+                SetWindowLongPtrW(hIP2,   GWLP_WNDPROC, (LONG_PTR)IpEdit_SubclassProc);
+                SetWindowLongPtrW(hIP3,   GWLP_WNDPROC, (LONG_PTR)IpEdit_SubclassProc);
+                SetWindowLongPtrW(hStart, GWLP_WNDPROC, (LONG_PTR)IpEdit_SubclassProc);
+                SetWindowLongPtrW(hEnd,   GWLP_WNDPROC, (LONG_PTR)IpEdit_SubclassProc);
+            }
         }
 
         return TRUE;
@@ -361,7 +511,7 @@ INT_PTR CALLBACK DlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM lParam) {
             int b = GetEditU8(hDlg, IDC_EDIT_IP2, ok2);
             int c = GetEditU8(hDlg, IDC_EDIT_IP3, ok3);
             int s = GetEditU8(hDlg, IDC_EDIT_START, okS);
-            int e = GetEditU8(hDlg, okE ? IDC_EDIT_END : IDC_EDIT_END, okE); // 保持原逻辑
+            int e = GetEditU8(hDlg, IDC_EDIT_END, okE);
 
             if (!(ok1 && ok2 && ok3 && okS && okE)) {
                 MessageBoxW(hDlg, L"请输入完整且有效的IP段（每段0-255）。", L"提示", MB_ICONINFORMATION);
@@ -428,6 +578,14 @@ INT_PTR CALLBACK DlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM lParam) {
     case WM_APP_ADD_IP: {
         std::unique_ptr<std::wstring> display(reinterpret_cast<std::wstring*>(lParam));
         if (display && !display->empty()) {
+            // 向后兼容：老版本只有 4 个 '\t'（IP + 4 服务），这里补一个“主机名”空列
+            size_t tabCount = 0;
+            for (wchar_t ch : *display) if (ch == L'\t') ++tabCount;
+            if (tabCount == 4) {
+                size_t p = display->find(L'\t');
+                if (p != std::wstring::npos) display->insert(p + 1, L"\t"); // 在 IP 后插入空主机名
+            }
+
             SendDlgItemMessageW(hDlg, IDC_LIST_RESULTS, LB_ADDSTRING, 0, reinterpret_cast<LPARAM>(display->c_str()));
             ++upCount;
             std::wstringstream ss; ss << L"扫描中... 已发现主机 " << upCount << L" 台";
