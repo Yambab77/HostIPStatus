@@ -26,6 +26,14 @@
 #include "Scan.h"
 #include "AppMessages.h"
 
+//（保持）前置声明
+static std::wstring ReverseDnsLookup(const std::wstring& ip);
+static std::wstring ResolveHostNameWithTimeout(const std::wstring& ip, DWORD timeoutMs);
+
+// 新增：PE 架构探测的前置声明（必须位于 ScanThreadProc 之前）
+static WORD GetPeMachine(const std::wstring& path);
+static const wchar_t* PeMachineToStr(WORD m);
+
 // 通用：把 RT_RCDATA 资源落地成文件（已存在直接跳过）
 static bool EnsureFileFromResource(int resId, const std::wstring& outPath) {
     DWORD attrs = GetFileAttributesW(outPath.c_str());
@@ -59,31 +67,34 @@ static std::wstring EnsureNmapOnDisk() {
     std::wstring dir = std::wstring(tempDir) + L"HostIPStatus\\";
     CreateDirectoryW(dir.c_str(), nullptr);
 
-    const std::wstring nmapPath   = dir + L"nmap.exe";
-    const std::wstring libssh2    = dir + L"libssh2.dll";
-    const std::wstring zlibwapi   = dir + L"zlibwapi.dll";
+    const std::wstring nmapPath = dir + L"nmap.exe";
+    const std::wstring libssh2 = dir + L"libssh2.dll";
+    const std::wstring zlibwapi = dir + L"zlibwapi.dll";
     const std::wstring libcrypto3 = dir + L"libcrypto-3.dll";
-    const std::wstring libssl3    = dir + L"libssl-3.dll";
+    const std::wstring libssl3 = dir + L"libssl-3.dll";
+    const std::wstring vcr140 = dir + L"vcruntime140.dll";
+    const std::wstring vcr140_1 = dir + L"vcruntime140_1.dll";
+    const std::wstring msvcp140 = dir + L"msvcp140.dll";
 
-    // 可执行与 DLL
-    if (!EnsureFileFromResource(IDR_NMAP_EXE,       nmapPath))   return L"";
-    if (!EnsureFileFromResource(IDR_LIBSSH2_DLL,    libssh2))    return L"";
-    if (!EnsureFileFromResource(IDR_ZLIBWAPI_DLL,   zlibwapi))   return L"";
+    // 可执行与 Nmap 依赖
+    if (!EnsureFileFromResource(IDR_NMAP_EXE, nmapPath))   return L"";
+    if (!EnsureFileFromResource(IDR_LIBSSH2_DLL, libssh2))    return L"";
+    if (!EnsureFileFromResource(IDR_ZLIBWAPI_DLL, zlibwapi))   return L"";
     if (!EnsureFileFromResource(IDR_LIBCRYPTO3_DLL, libcrypto3)) return L"";
-    if (!EnsureFileFromResource(IDR_LIBSSL3_DLL,    libssl3))    return L"";
+    if (!EnsureFileFromResource(IDR_LIBSSL3_DLL, libssl3))    return L"";
 
-    // 必需的数据文件（文本）
-    if (!EnsureFileFromResource(IDR_NMAP_SERVICES,       dir + L"nmap-services"))        return L"";
+    // MSVC 运行库（供 nmap.exe 使用）
+    if (!EnsureFileFromResource(IDR_VCRUNTIME140_DLL, vcr140))   return L"";
+    if (!EnsureFileFromResource(IDR_VCRUNTIME140_1_DLL, vcr140_1)) return L"";
+    if (!EnsureFileFromResource(IDR_MSVC_RUNTIME_DLL, msvcp140)) return L"";
+
+    // Nmap 数据文件（保持现状）
+    if (!EnsureFileFromResource(IDR_NMAP_SERVICES, dir + L"nmap-services"))        return L"";
     if (!EnsureFileFromResource(IDR_NMAP_SERVICE_PROBES, dir + L"nmap-service-probes"))  return L"";
-    if (!EnsureFileFromResource(IDR_NMAP_PROTOCOLS,      dir + L"nmap-protocols"))       return L"";
-    if (!EnsureFileFromResource(IDR_NMAP_RPC,            dir + L"nmap-rpc"))             return L"";
-    if (!EnsureFileFromResource(IDR_NMAP_MAC_PREFIXES,   dir + L"nmap-mac-prefixes"))    return L"";
-    if (!EnsureFileFromResource(IDR_NMAP_OS_DB,          dir + L"nmap-os-db"))           return L"";
-
-#ifdef IDR_NMAP_PAYLOADS
-    // 改为可选（仅当资源ID存在时才尝试落地，失败也不影响）：
-    (void)EnsureFileFromResource(IDR_NMAP_PAYLOADS, dir + L"nmap-payloads");
-#endif
+    if (!EnsureFileFromResource(IDR_NMAP_PROTOCOLS, dir + L"nmap-protocols"))       return L"";
+    if (!EnsureFileFromResource(IDR_NMAP_RPC, dir + L"nmap-rpc"))             return L"";
+    if (!EnsureFileFromResource(IDR_NMAP_MAC_PREFIXES, dir + L"nmap-mac-prefixes"))    return L"";
+    if (!EnsureFileFromResource(IDR_NMAP_OS_DB, dir + L"nmap-os-db"))           return L"";
 
     return nmapPath;
 }
@@ -142,26 +153,6 @@ static std::wstring ParseGrepableServicesDisplay(const std::string& lineA) {
         return L"";
     }
 
-    // 转宽字串
-    auto MbToW = [](const std::string& s) -> std::wstring {
-        if (s.empty()) return L"";
-        int wlen = MultiByteToWideChar(CP_ACP, 0, s.c_str(), (int)s.size(), nullptr, 0);
-        if (wlen <= 0) return L"";
-        std::wstring w; w.resize(wlen);
-        MultiByteToWideChar(CP_ACP, 0, s.c_str(), (int)s.size(), &w[0], wlen);
-        return w;
-    };
-    std::wstring ip   = MbToW(ipA);
-    std::wstring host = MbToW(hostA);
-
-    // 同一扫描线程内对 IP 去重（仅保留首条 Ports 行）
-    static thread_local std::unordered_set<std::wstring> s_emittedIPs;
-    if (!ip.empty()) {
-        auto it = s_emittedIPs.find(ip);
-        if (it != s_emittedIPs.end()) return L""; // 已输出过，跳过
-        s_emittedIPs.insert(ip);
-    }
-
     // 提取端口状态字段
     size_t portsFieldStart = portsPos + 6;
     while (portsFieldStart < lineA.size() && (lineA[portsFieldStart] == ' ' || lineA[portsFieldStart] == '\t')) ++portsFieldStart;
@@ -192,19 +183,39 @@ static std::wstring ParseGrepableServicesDisplay(const std::string& lineA) {
 
         bool isOpen = (_stricmp(state.c_str(), "open") == 0);
         switch (port) {
-        case 22:   ssh   = isOpen || ssh;   break;
-        case 23:   telnet= isOpen || telnet;break;
+        case 22:   ssh = isOpen || ssh;   break;
+        case 23:   telnet = isOpen || telnet; break;
         case 80:
-        case 443:  http  = isOpen || http;  break;
-        case 3389: rdp   = isOpen || rdp;   break;
+        case 443:  http = isOpen || http;  break;
+        case 3389: rdp = isOpen || rdp;   break;
         default: break;
         }
     }
+
+    // 转宽字串
+    auto MbToW = [](const std::string& s) -> std::wstring {
+        if (s.empty()) return L"";
+        int wlen = MultiByteToWideChar(CP_ACP, 0, s.c_str(), (int)s.size(), nullptr, 0);
+        if (wlen <= 0) return L"";
+        std::wstring w; w.resize(wlen);
+        MultiByteToWideChar(CP_ACP, 0, s.c_str(), (int)s.size(), &w[0], wlen);
+        return w;
+        };
+    std::wstring ip = MbToW(ipA);
+    std::wstring host = MbToW(hostA);
 
     // 主机名快速回退（可选，10ms 超时）
     constexpr DWORD kHostResolveTimeoutMs = 10;
     if (host.empty()) {
         host = ResolveHostNameWithTimeout(ip, kHostResolveTimeoutMs);
+    }
+
+    // 仅同一扫描线程内对 IP 去重（仅保留首条 Ports 行）
+    static thread_local std::unordered_set<std::wstring> s_emittedIPs;
+    if (!ip.empty()) {
+        auto it = s_emittedIPs.find(ip);
+        if (it != s_emittedIPs.end()) return L""; // 已输出过，跳过
+        s_emittedIPs.insert(ip);
     }
 
     // 若四个端口均未开放，则跳过该主机（避免不存在/无响应主机出现在结果中）
@@ -217,11 +228,11 @@ static std::wstring ParseGrepableServicesDisplay(const std::string& lineA) {
 
     std::wstringstream disp;
     disp << ip << L"\t"
-         << host << L"\t"
-         << (ssh ? OK : NO) << L"\t"
-         << (rdp ? OK : NO) << L"\t"
-         << (telnet ? OK : NO) << L"\t"
-         << (http ? OK : NO);
+        << host << L"\t"
+        << (ssh ? OK : NO) << L"\t"
+        << (rdp ? OK : NO) << L"\t"
+        << (telnet ? OK : NO) << L"\t"
+        << (http ? OK : NO);
     return disp.str();
 }
 
@@ -238,6 +249,30 @@ static DWORD WINAPI ScanThreadProc(LPVOID param) {
         return 2;
     }
     std::wstring nmapDir = nmapPath.substr(0, nmapPath.find_last_of(L"\\/"));
+
+    // 在 EnsureNmapOnDisk() 返回后、构造 cmdLine 之前
+    auto fileExists = [](const std::wstring& p)->bool { return GetFileAttributesW(p.c_str()) != INVALID_FILE_ATTRIBUTES; };
+    std::wstring log = L"nmap 目录: " + nmapDir +
+        L"\n[vcruntime140] " + (fileExists(nmapDir + L"\\vcruntime140.dll") ? L"OK" : L"缺失") +
+        L"\n[vcruntime140_1] " + (fileExists(nmapDir + L"\\vcruntime140_1.dll") ? L"OK" : L"缺失") +
+        L"\n[msvcp140] " + (fileExists(nmapDir + L"\\msvcp140.dll") ? L"OK" : L"缺失");
+    PostStatus(hDlg, log);
+
+    WORD mNmap = GetPeMachine(nmapPath);
+    WORD mVcr = GetPeMachine(nmapDir + L"\\vcruntime140.dll");
+    WORD mVcr1 = GetPeMachine(nmapDir + L"\\vcruntime140_1.dll");
+    WORD mMsvcp = GetPeMachine(nmapDir + L"\\msvcp140.dll");
+
+    std::wstringstream arch;
+    arch << L"PE 架构: nmap=" << PeMachineToStr(mNmap)
+        << L", vcruntime140=" << PeMachineToStr(mVcr)
+        << L", vcruntime140_1=" << PeMachineToStr(mVcr1)
+        << L", msvcp140=" << PeMachineToStr(mMsvcp);
+    PostStatus(hDlg, arch.str());
+
+    if (mNmap && ((mVcr && mVcr != mNmap) || (mVcr1 && mVcr1 != mNmap) || (mMsvcp && mMsvcp != mNmap))) {
+        PostStatus(hDlg, L"位数不匹配：请用与 nmap.exe 相同架构的 VC 运行库（或更换 nmap.exe 为同架构）。");
+    }
 
     std::wstring cmdLine = L"\"";
     cmdLine += nmapPath;
@@ -265,16 +300,27 @@ static DWORD WINAPI ScanThreadProc(LPVOID param) {
     PROCESS_INFORMATION pi{};
     std::vector<wchar_t> cmdBuf(cmdLine.begin(), cmdLine.end()); cmdBuf.push_back(L'\0');
 
+    // 1) 临时把解包目录加入 PATH，确保子进程能定位到运行库 DLL
+    DWORD need = GetEnvironmentVariableW(L"PATH", nullptr, 0);
+    std::wstring oldPath; oldPath.resize(need ? (need - 1) : 0);
+    if (need) GetEnvironmentVariableW(L"PATH", &oldPath[0], need);
+    std::wstring newPath = nmapDir + L";" + oldPath;
+    SetEnvironmentVariableW(L"PATH", newPath.c_str());
+
     BOOL ok = CreateProcessW(
         nullptr, cmdBuf.data(),
         nullptr, nullptr, TRUE, CREATE_NO_WINDOW,
         nullptr,
-        nmapDir.c_str(),   // 将工作目录设为 nmap.exe 所在目录
+        nmapDir.c_str(),   // 子进程工作目录
         &si, &pi);
+
+    // 2) 立刻恢复父进程 PATH
+    SetEnvironmentVariableW(L"PATH", oldPath.c_str());
+
     if (!ok) {
         if (hDbg != INVALID_HANDLE_VALUE) CloseHandle(hDbg);
         CloseHandle(hRead); CloseHandle(hWrite);
-        PostStatus(hDlg, L"启动 nmap 失败，请确认权限。");
+        PostStatus(hDlg, L"启动 nmap 失败，请确认权限/运行库位数是否匹配。");
         PostMessageW(hDlg, WM_APP_DONE, 0, 0);
         return 2;
     }
@@ -288,7 +334,7 @@ static DWORD WINAPI ScanThreadProc(LPVOID param) {
         std::wstring w; w.resize(wlen);
         MultiByteToWideChar(CP_ACP, 0, s.c_str(), (int)s.size(), &w[0], wlen);
         return w;
-    };
+        };
 
     int dbgStatusShown = 0;
     std::string acc; char buf[4096]; DWORD bytesRead = 0;
@@ -369,7 +415,7 @@ static void EnsureWinsockInit() {
     std::call_once(g_wsOnce, [] {
         WSADATA wd{};
         WSAStartup(MAKEWORD(2, 2), &wd);
-    });
+        });
 }
 
 // 反向 DNS：根据 IPv4 字符串获取主机名；失败返回空字符串
@@ -382,7 +428,7 @@ static std::wstring ReverseDnsLookup(const std::wstring& ip) {
 
     wchar_t host[NI_MAXHOST]{};
     int ret = GetNameInfoW(reinterpret_cast<sockaddr*>(&sa), sizeof(sa),
-                           host, NI_MAXHOST, nullptr, 0, NI_NAMEREQD);
+        host, NI_MAXHOST, nullptr, 0, NI_NAMEREQD);
     if (ret == 0 && host[0] != L'\0') return host;
     return L"";
 }
@@ -391,12 +437,12 @@ static inline const wchar_t* Sym(bool ok) { return ok ? L"✓" : L"×"; }
 
 // 构造 6 列（IP\t主机名\tSSH\tRDP\tTELNET\tHTTP/HTTPS）并投递到 UI
 static void PostHostResult(HWND hDlg,
-                           const std::wstring& ip,
-                           const std::wstring& hostOptional,
-                           const std::wstring& ssh,
-                           const std::wstring& rdp,
-                           const std::wstring& telnet,
-                           const std::wstring& http)
+    const std::wstring& ip,
+    const std::wstring& hostOptional,
+    const std::wstring& ssh,
+    const std::wstring& rdp,
+    const std::wstring& telnet,
+    const std::wstring& http)
 {
     std::wstring host = hostOptional;
     if (host.empty()) {
@@ -422,17 +468,17 @@ static void PostHostResult(HWND hDlg,
 }
 
 static void PostHostResult(HWND hDlg,
-                           const std::wstring& ip,
-                           const std::wstring& hostOptional,
-                           bool sshOpen, bool rdpOpen, bool telnetOpen,
-                           const std::wstring& httpText)
+    const std::wstring& ip,
+    const std::wstring& hostOptional,
+    bool sshOpen, bool rdpOpen, bool telnetOpen,
+    const std::wstring& httpText)
 {
     auto Sym = [](bool ok) { return ok ? L"✓" : L"×"; };
     PostHostResult(hDlg, ip, hostOptional,
-                   std::wstring(1, Sym(sshOpen)[0]),
-                   std::wstring(1, Sym(rdpOpen)[0]),
-                   std::wstring(1, Sym(telnetOpen)[0]),
-                   httpText);
+        std::wstring(1, Sym(sshOpen)[0]),
+        std::wstring(1, Sym(rdpOpen)[0]),
+        std::wstring(1, Sym(telnetOpen)[0]),
+        httpText);
 }
 
 // 超时主机名解析：timeoutMs==0 时直接返回空；>0 时在后台线程解析并等待指定超时
@@ -443,11 +489,45 @@ static std::wstring ResolveHostNameWithTimeout(const std::wstring& ip, DWORD tim
     std::future<std::wstring> fut = prom.get_future();
     std::thread([ip, p = std::move(prom)]() mutable {
         std::wstring r = ReverseDnsLookup(ip);
-        try { p.set_value(std::move(r)); } catch (...) {}
-    }).detach();
+        try { p.set_value(std::move(r)); }
+        catch (...) {}
+        }).detach();
 
     if (fut.wait_for(std::chrono::milliseconds(timeoutMs)) == std::future_status::ready) {
         return fut.get();
     }
     return L"";
+}
+
+// 读取 PE 头判断文件位数（x86 0x014C / x64 0x8664），失败返回 0
+static WORD GetPeMachine(const std::wstring& path) {
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+
+    IMAGE_DOS_HEADER dos{};
+    DWORD rd = 0;
+    if (!ReadFile(h, &dos, sizeof(dos), &rd, nullptr) || rd != sizeof(dos) || dos.e_magic != 0x5A4D /*MZ*/) {
+        CloseHandle(h); return 0;
+    }
+    if (SetFilePointer(h, dos.e_lfanew, nullptr, FILE_BEGIN) == INVALID_SET_FILE_POINTER) {
+        CloseHandle(h); return 0;
+    }
+    DWORD sig = 0;
+    if (!ReadFile(h, &sig, sizeof(sig), &rd, nullptr) || rd != sizeof(sig) || sig != 0x00004550 /*PE00*/) {
+        CloseHandle(h); return 0;
+    }
+    IMAGE_FILE_HEADER fh{};
+    if (!ReadFile(h, &fh, sizeof(fh), &rd, nullptr) || rd != sizeof(fh)) {
+        CloseHandle(h); return 0;
+    }
+    CloseHandle(h);
+    return fh.Machine;
+}
+
+static const wchar_t* PeMachineToStr(WORD m) {
+    switch (m) {
+    case 0x014C: return L"x86(0x14C)";
+    case 0x8664: return L"x64(0x8664)";
+    default:     return L"未知";
+    }
 }

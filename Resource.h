@@ -57,11 +57,15 @@
 #endif // RESOURCE_H_INCLUDED
 // Nmap 二进制资源 ID
 // 二进制资源 ID，确保唯一且与 .rc 对应
-#define IDR_NMAP_EXE          5001
-#define IDR_LIBSSH2_DLL       5002
-#define IDR_ZLIBWAPI_DLL      5003
-#define IDR_LIBCRYPTO3_DLL    5004
-#define IDR_LIBSSL3_DLL       5005
+#define IDR_NMAP_EXE				5001
+#define IDR_LIBSSH2_DLL				5002
+#define IDR_ZLIBWAPI_DLL			5003
+#define IDR_LIBCRYPTO3_DLL			5004
+#define IDR_LIBSSL3_DLL				5005
+#define IDR_VCRUNTIME140_DLL		5006
+#define IDR_MSVC_RUNTIME_DLL		5007
+#define IDR_VCRUNTIME140_1_DLL		5008
+
 // Nmap 数据文件资源 ID（新增）
 #define IDR_NMAP_SERVICES          5010
 #define IDR_NMAP_SERVICE_PROBES    5011
